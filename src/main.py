@@ -1,11 +1,14 @@
+import os
+import csv
 import asyncio
 import httpx
 import json
 import psutil
 import subprocess
+from pathlib import Path
 from time import perf_counter_ns
 
-URL= "http://localhost:11434/api/generate"
+API_URL= "http://localhost:11434/api/generate"
 HOST_ID = "localhost"
 MONITORING_SCOPE = "ollama_host_local"
 LLM_MODEL = "llama3.1:8b"
@@ -62,6 +65,13 @@ WORKLOADS = {
     },
 }
 
+def write_results(results, file):
+    fieldnames = results[0].keys()
+
+    with open(file, mode='w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
 
 def collect_gpu_resources():
     try:
@@ -71,45 +81,44 @@ def collect_gpu_resources():
             "--format=csv,noheader,nounits"
         ], text=True)
 
-        host_gpu_util_percent, host_vram_used, host_vram_total_mb, host_gpu_temperature = map(
+        host_gpu_util_percent, host_vram_used_mb, host_vram_total_mb, host_gpu_temperature = map(
             int,
             out.strip().split(", ")
         )
     except:
         host_gpu_util_percent = None
-        host_vram_used = None
+        host_vram_used_mb = None
         host_vram_total_mb = None
         host_gpu_temperature = None
 
-    return host_gpu_util_percent, host_vram_used, host_vram_total_mb, host_gpu_temperature
+    return host_gpu_util_percent, host_vram_used_mb, host_vram_total_mb, host_gpu_temperature
      
-
 def collect_resources():
     sample_timestamp_ns = perf_counter_ns()
 
     host_cpu_percent = psutil.cpu_percent()
 
     memory = psutil.virtual_memory()
-    host_memory_used = memory.used / 1024**2
+    host_memory_used_mb = memory.used / 1024**2
     host_memory_percent = memory.percent
 
     disk_io = psutil.disk_io_counters()
     host_disk_read_mb_total = disk_io.read_bytes / 1024**2
     host_disk_write_mb_total = disk_io.write_bytes / 1024**2
 
-    host_gpu_util_percent, host_vram_used, host_vram_total_mb, host_gpu_temperature = collect_gpu_resources()
+    host_gpu_util_percent, host_vram_used_mb, host_vram_total_mb, host_gpu_temperature = collect_gpu_resources()
 
     resources_sample = {
         "host_id": HOST_ID,
         "monitoring_scope": MONITORING_SCOPE,
         "sample_timestamp_ns": sample_timestamp_ns,
         "host_cpu_percent": host_cpu_percent,
-        "host_memory_used": host_memory_used,
+        "host_memory_used_mb": host_memory_used_mb,
         "host_memory_percent": host_memory_percent,
         "host_disk_read_mb_total": host_disk_read_mb_total,
         "host_disk_write_mb_total": host_disk_write_mb_total,
         "host_gpu_util_percent": host_gpu_util_percent,
-        "host_vram_used": host_vram_used,
+        "host_vram_used_mb": host_vram_used_mb,
         "host_vram_total_mb": host_vram_total_mb,
         "host_gpu_temperature": host_gpu_temperature,
     }
@@ -156,7 +165,7 @@ async def chat(client, user_id, llm_model, workload):
     client_tps = None
 
 
-    async with client.stream("POST", URL, json=payload) as response:
+    async with client.stream("POST", API_URL, json=payload) as response:
         response.raise_for_status()
 
         async for line in response.aiter_lines():
@@ -190,7 +199,7 @@ async def chat(client, user_id, llm_model, workload):
                 success = True
                 break
 
-    return {
+    request_metrics = {
         "user_id": user_id,
         "llm_model": llm_model,
         "success": success,
@@ -202,15 +211,23 @@ async def chat(client, user_id, llm_model, workload):
         "prompt_category": workload["prompt_category"],
         "output_category": workload["output_category"],
     }
+    return request_metrics
 
 async def main():
     llm_model = LLM_MODEL
-    user_amount = 3
-    results = []
-    resource_samples = []
     workload = WORKLOADS["short_prompt_short_output"]
-    benchmark_start_ns = perf_counter_ns()
+    user_amount = 5
+
+    request_metrics = []
+    resource_samples = []
+    script_dir = Path(__file__).resolve().parent
+    output_dir = script_dir.parent / "output"
+    os.makedirs(output_dir, exist_ok=True) # exist dir if not present
+    request_metrics_path = output_dir / "client_metrics.csv"
+    resource_samples_path = output_dir / "host_metrics.csv"
+
     stop_event = asyncio.Event()
+    benchmark_start_ns = perf_counter_ns()
 
     async with httpx.AsyncClient(timeout=None) as client:
         monitor_task = asyncio.create_task(
@@ -221,13 +238,13 @@ async def main():
             run_one_user(client, i+1, llm_model, workload)
             for i in range(user_amount)
         ]
-        results = await asyncio.gather(*tasks)
+        request_metrics = await asyncio.gather(*tasks)
 
         stop_event.set()
         await monitor_task
 
-    request_count = len(results)
-    success_count = sum(1 for result in results if result["success"])
+    request_count = len(request_metrics)
+    success_count = sum(1 for result in request_metrics if result["success"])
     success_rate = success_count / request_count
 
     total_time_s = (perf_counter_ns() - benchmark_start_ns) / 1_000_000_000
@@ -242,6 +259,11 @@ async def main():
     print(f"RESOURCE SAMPLES: {len(resource_samples)}")
     print(f"FIRST SAMPLE: {resource_samples[0]}")
     print(f"LAST SAMPLE: {resource_samples[-1]}")
+
+    write_results(resource_samples, resource_samples_path)
+    write_results(request_metrics, request_metrics_path)
+
+    print(f"\n==> RESULTS ARE WRITTEN IN: {output_dir}")
 
 if __name__ == "__main__":
     asyncio.run(main())
