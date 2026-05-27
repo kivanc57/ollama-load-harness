@@ -2,4 +2,5 @@ venv
 .env/
 **/test.py
 output/
+**/__pycache__
 
