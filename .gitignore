@@ -3,4 +3,5 @@ venv
 **/test.py
 output/
 **/__pycache__
+task.md
 
